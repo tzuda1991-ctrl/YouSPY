@@ -40,7 +40,7 @@ object Config {
         get() = get("code")
         set(v) = set("code", v)
 
-    var connected: Boolean
+    val connected: Boolean
         get() = token.isNotEmpty() && chat.isNotEmpty()
 
     var offset: Long
