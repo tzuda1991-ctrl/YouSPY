@@ -34,10 +34,25 @@ object Shell {
         }
     }
 
+    /**
+     * Shizuku 13 me newProcess() Kotlin-level par private hai.
+     * JVM method public hi hai, isliye reflection se call karte hain.
+     */
     private fun runShizuku(cmd: String, timeoutMs: Long): String = runCatching {
-        val proc = Shizuku.newProcess(arrayOf("sh", "-c", cmd), null, null)
+        val cls = Class.forName("rikka.shizuku.Shizuku")
+        val m = cls.getDeclaredMethod(
+            "newProcess",
+            Array<String>::class.java,
+            Array<String>::class.java,
+            String::class.java
+        )
+        m.isAccessible = true
+        val proc = m.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
         collect(proc, timeoutMs)
-    }.getOrElse { "ERR: ${it.message}" }
+    }.getOrElse {
+        // reflection fail ho to normal shell par gir jao
+        run(arrayOf("sh", "-c", cmd), timeoutMs)
+    }
 
     private fun run(argv: Array<String>, timeoutMs: Long): String = runCatching {
         val proc = Runtime.getRuntime().exec(argv)
@@ -57,9 +72,7 @@ object Shell {
         proc.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
         t.join(1500)
         runCatching { proc.destroy() }
-        val err = runCatching {
-            proc.errorStream.bufferedReader().readText()
-        }.getOrDefault("")
+        val err = runCatching { proc.errorStream.bufferedReader().readText() }.getOrDefault("")
         return (out.toString() + err).trim().ifEmpty { "(no output)" }
     }
 }
