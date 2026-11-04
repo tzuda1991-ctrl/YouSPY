@@ -1,3 +1,4 @@
+
 package com.you.spy.service
 
 import android.app.Notification
@@ -13,17 +14,32 @@ class SpyNotificationListener : NotificationListenerService() {
         fun recent(limit: Int): String = synchronized(buffer) {
             buffer.takeLast(limit).joinToString("\n").ifEmpty { "none" }
         }
+
+        fun recentFrom(pkg: String, limit: Int): String = synchronized(buffer) {
+            buffer.filter { it.startsWith("$pkg |") }
+                .takeLast(limit)
+                .joinToString("\n")
+                .ifEmpty { "is package ke liye kuch nahi" }
+        }
     }
 
-    override fun onListenerConnected() { instance = this }
-    override fun onListenerDisconnected() { instance = null }
+    override fun onListenerConnected() {
+        instance = this
+    }
+
+    override fun onListenerDisconnected() {
+        instance = null
+    }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         val ex = sbn.notification?.extras ?: return
         val title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
         val text = ex.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
+
         if (title.isBlank() && text.isBlank()) return
+
         val line = "${sbn.packageName} | $title | $text"
+
         synchronized(buffer) {
             buffer.addLast(line)
             while (buffer.size > 300) buffer.removeFirst()
