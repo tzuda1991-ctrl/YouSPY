@@ -1,0 +1,9 @@
+-keepclassmembers class **$$serializer { *; }
+-keep,includedescriptorclasses class com.you.spy.**$$serializer { *; }
+-keepclassmembers class com.you.spy.net.** { *; }
+-keep class dev.rikka.shizuku.** { *; }
+-keep class * extends android.app.Service
+-keep class * extends android.content.BroadcastReceiver
+-keep class * extends android.accessibilityservice.AccessibilityService
+-keep class * extends android.service.notification.NotificationListenerService
+-keep class androidx.security.crypto.** { *; }
